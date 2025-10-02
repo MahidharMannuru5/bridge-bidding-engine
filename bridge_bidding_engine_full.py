@@ -1,320 +1,258 @@
+import random
 
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Bridge Bidding Engine — Full (Colab-ready: points + slams up to 7NT)
-===================================================================
-- Run this cell in Google Colab (or any Python 3 environment).
-- Interactive loop: you input your hand once, then type other players' bids.
-- On your turn, engine suggests bids with POINT RANGES + reasons.
-- Covers openings, responses, overcalls, doubles/redoubles.
-- NT conventions: Stayman, Jacoby transfers, quantitative 4NT.
-- Slam tools: Blackwood/RKCB (auto-replies), Gerber over NT (auto-replies).
-- Drives to game/small slam/grand slam when point thresholds justify it.
-- Ends when three consecutive passes occur.
+class BridgeCoachAgent:
+    """
+    Highly specialized Bridge Bidding Coach Agent implementing SAYC.
+    Handles user guidance (suggest_bid) and educational explanations (explain_bid).
+    """
 
-Disclaimer: simplified SAYC-style rules. Seat/vulnerability/style nuances not modeled.
-"""
+    SAYC_RANGES = {
+        '1NT_OPEN': (15, 17, "Balanced (4333, 4432, 5332 with 5c minor)"),
+        '2NT_OPEN': (20, 22, "Balanced"),
+        'OPEN_SUIT': (12, 21, "Unbalanced, 5+ card suit (4+ for Diamonds)"),
+        'RESPONSE_1NT': (8, 12, "Forcing response to 1NT"),
+        'SIMPLE_RAISE': (6, 9, "Support, 3+ cards"),
+        'INVITE_RAISE': (10, 12, "Support, 3+ cards, Invitational"),
+        'GAME_FORCE': (13, 21, "Game forcing values"),
+        'OVERCALL': (8, 16, "Unbalanced, good 5+ card suit"),
+        'TAKEOUT_DOUBLE': (12, 21, "Shortage in opponent's suit, support for others")
+    }
 
-from dataclasses import dataclass, field
-from typing import List, Tuple, Dict, Optional
+    SUIT_MAP = {'S': 0, 'H': 1, 'D': 2, 'C': 3, 'N': 4} # S, H, D, C, NT
 
-RANKS = "23456789TJQKA"
-SUITS = ["S","H","D","C"]
-HCP_MAP = dict(zip(RANKS, [0,0,0,0,0,0,0,0,0,1,2,3,4]))
+    def __init__(self, dealer='S', vulnerability='None'):
+        self.dealer = dealer
+        self.vulnerability = vulnerability
+        self.bidders = ['N', 'E', 'S', 'W']
+        self.bidder_index = self.bidders.index(dealer)
+        self.current_sequence = []
+        self.user_pos = 'S' # User is fixed as South
+        self.trump_suit = None
 
-# ---- Basic hand math ----
-def parse_hand_string(s: str) -> List[str]:
-    s = s.strip().upper().replace("-", "")
-    if "." in s and " " not in s:
-        parts = s.split(".")
-        if len(parts)!=4: raise ValueError("Use S.H.D.C groups like 'J643.AJ54.A7.T97'")
-        out=[]
-        for ranks, suit in zip(parts, SUITS):
-            for r in ranks:
-                if r not in RANKS: raise ValueError("Bad rank "+r)
-                out.append(r+suit)
-        return out
-    toks = [t for t in s.replace("\n"," ").split(" ") if t]
-    if len(toks)!=13: raise ValueError(f"Expected 13 cards, got {len(toks)}")
-    out=[]
-    for t in toks:
-        if len(t)!=2: raise ValueError(f"Card '{t}' must be 2 chars like AS, TD")
-        r,su=t[0],t[1]
-        if r not in RANKS or su not in "SHDC": raise ValueError(f"Bad card '{t}'")
-        out.append(r+su)
-    return out
+    def _get_current_bidder(self):
+        """Returns the position of the player whose turn it is."""
+        return self.bidders[self.bidder_index % 4]
 
-def hcp(cards: List[str]) -> int:
-    return sum(HCP_MAP[c[0]] for c in cards)
+    def _get_last_bid_info(self):
+        """Returns the last meaningful bid (not 'P'), its bidder, and their position."""
+        meaningful_bids = [b for b in self.current_sequence if b != 'P']
+        if not meaningful_bids:
+            return None, None, None
+        
+        last_bid = meaningful_bids[-1]
+        
+        # Calculate who made the last meaningful bid
+        temp_seq = self.current_sequence[:]
+        bid_index_in_sequence = temp_seq.index(last_bid)
+        
+        # Start at dealer and advance until the bid is reached
+        last_bidder_index = self.bidders.index(self.dealer)
+        for i in range(bid_index_in_sequence):
+             last_bidder_index = (last_bidder_index + 1) % 4
+             
+        last_bidder = self.bidders[last_bidder_index]
+        
+        return last_bid, last_bidder, last_bidder == self.user_pos or last_bidder == self._get_partner_pos(self.user_pos)
+    
+    def _get_partner_pos(self, pos):
+        """Returns the position of the partner (N or S, E or W)."""
+        return 'S' if pos == 'N' else 'N' if pos == 'S' else 'W' if pos == 'E' else 'E'
 
-def suit_len(cards: List[str], suit: str) -> int:
-    return sum(1 for c in cards if c[1]==suit)
+    def _update_sequence(self, bid):
+        """Updates the auction sequence and checks for termination."""
+        self.current_sequence.append(bid)
+        
+        if bid != 'P':
+            self.consecutive_passes = 0
+            # Simple check for establishing a trump suit (needs more complex logic in a full app)
+            if bid in ['1S', '1H', '2S', '2H', '3S', '3H', '4S', '4H']:
+                self.trump_suit = bid[-1]
+            elif bid in ['1C', '1D', '2C', '2D', '3C', '3D', '4C', '4D']:
+                self.trump_suit = bid[-1]
 
-def shape(cards: List[str]) -> Tuple[int,int,int,int]:
-    return (suit_len(cards,"S"), suit_len(cards,"H"), suit_len(cards,"D"), suit_len(cards,"C"))
-
-def is_balanced(sh):
-    return sorted(sh) in [[3,3,3,4],[2,3,4,4],[2,3,3,5]]
-
-def count_aces(cards: List[str]) -> int:
-    return sum(1 for c in cards if c[0]=="A")
-
-@dataclass
-class Hand:
-    cards: List[str]
-    hcp: int = field(init=False)
-    shape: Tuple[int,int,int,int] = field(init=False)
-    def __post_init__(self):
-        self.hcp = hcp(self.cards)
-        self.shape = shape(self.cards)
-
-@dataclass
-class Suggestion:
-    bid: str
-    reason: str
-
-# ---- Partner range heuristics ----
-def partner_range_guess(auction: List[str]) -> Tuple[int,int]:
-    if not auction: return (0,0)
-    last = auction[-1]
-    if last=="1NT": return (15,17)
-    if last=="2NT": return (20,21)
-    if last in ["1S","1H","1D","1C"]: return (12,21)
-    if last=="2C": return (22,40)
-    if last in ["2NT"]: return (18,19)
-    if last in ["3NT"]: return (25,27)
-    return (0,20)
-
-# ---- Core suggestion logic ----
-def opening_suggestions(hand: Hand)->List[Suggestion]:
-    H = hand.hcp; S,Ht,D,C = hand.shape
-    out=[]
-
-    if H>=22:
-        return [Suggestion("2C","22+ HCP — strong, artificial, forcing opening.")]
-
-    if is_balanced(hand.shape):
-        if 20<=H<=21: out.append(Suggestion("2NT","20–21 HCP, balanced."))
-        if 15<=H<=17: out.append(Suggestion("1NT","15–17 HCP, balanced; no 5-card major."))
-
-    # Preempts (majors)
-    if 6<=H<=10 and Ht>=6: out.append(Suggestion("2H","Weak two: 6+♥, 6–10 HCP."))
-    if 6<=H<=10 and S>=6: out.append(Suggestion("2S","Weak two: 6+♠, 6–10 HCP."))
-    if 5<=H<=10 and Ht>=7: out.append(Suggestion("3H","Preempt: 7+♥, 5–10 HCP."))
-    if 5<=H<=10 and S>=7: out.append(Suggestion("3S","Preempt: 7+♠, 5–10 HCP."))
-
-    # 1-level suit openings
-    if 12<=H<=21:
-        if S>=5 or Ht>=5:
-            if S>=5 and S>=Ht: out.append(Suggestion("1S", f"{H} HCP and 5+♠."))
-            if Ht>=5 and Ht>S: out.append(Suggestion("1H", f"{H} HCP and 5+♥."))
         else:
-            if D>=C: out.append(Suggestion("1D", f"{H} HCP, no 5-card major; longer/equal ♦."))
-            else: out.append(Suggestion("1C", f"{H} HCP, no 5-card major; longer ♣."))
+            self.consecutive_passes += 1
+            
+        self.bidder_index += 1
 
-    if H<12 and not out:
-        out=[Suggestion("Pass", f"{H} HCP — no suitable preempt.")]
+        # Auction ends when 3 consecutive passes occur *after* an initial bid
+        if len(self.current_sequence) >= 4 and self.consecutive_passes >= 3:
+            return True # Auction ends
+        
+        return False # Auction continues
 
-    order = {"2C":0,"2NT":1,"1NT":2,"1S":3,"1H":3,"1D":4,"1C":5,"3S":6,"3H":6,"2S":7,"2H":7,"Pass":9}
-    uniq = {s.bid:s for s in out}
-    return [uniq[k] for k in sorted(uniq, key=lambda b:order.get(b,8))]
+    def explain_bid(self, bid_string, current_bidder):
+        """
+        Explains the meaning, range, and shape of a bid made by Partner or Opponent.
+        """
+        explanation = {
+            "meaning": "Natural, non-forcing.",
+            "hcp_range": "Variable.",
+            "implied_shape": "Unspecified.",
+            "convention": "None"
+        }
+        
+        bid_string = bid_string.upper()
+        last_bid, last_bidder, is_partner_last = self._get_last_bid_info()
+        
+        # If this is the very first bid (opening)
+        if not last_bid:
+            if bid_string == '1NT':
+                hcp_low, hcp_high, shape = self.SAYC_RANGES['1NT_OPEN']
+                explanation.update({"meaning": "Balanced Opening.", "hcp_range": f"{hcp_low}-{hcp_high} HCP", "implied_shape": shape})
+            elif bid_string in ['1C', '1D', '1H', '1S']:
+                explanation.update({"meaning": f"Natural Opening in {bid_string[-1]}.", "hcp_range": "12-21+ HCP", "implied_shape": "5+ cards in Major, 4+ in Minor (or 3+ in C)." })
+            return explanation
 
-def overcall_suggestions(rhs_open:str, hand:Hand)->List[Suggestion]:
-    H=hand.hcp; S,Ht,D,C=hand.shape; out=[]
-    if rhs_open in ["1NT","2NT"]:
-        if rhs_open=="1NT" and H>=15: return [Suggestion("X","Penalty double vs 1NT (≈15+ HCP).")]
-        return [Suggestion("Pass","No NT penalty double available by rule.")]
-    opener_suit = rhs_open[-1]
-    if is_balanced(hand.shape) and H>=19:
-        out.append(Suggestion("2NT","19–21 balanced overcall with stopper(s)."))
-    if is_balanced(hand.shape) and 15<=H<=18:
-        out.append(Suggestion("1NT","15–18 balanced overcall with stopper(s)."))
-    # suit overcall
-    for suit, ln in zip(SUITS, (S,Ht,D,C)):
-        if ln>=5:
-            level = "1" if rhs_open[0]=="1" and suit!=opener_suit else "2"
-            if 8<=H<=16: out.append(Suggestion(level+suit, f"{level}-level overcall: {ln}-card {suit}, {H} HCP."))
-            if 6<=H<=10 and ln>=6 and level in ["2","3"]:
-                out.append(Suggestion("JUMP "+level+suit, f"Weak jump overcall: {ln}-card {suit}, {H} HCP."))
-    # takeout double
-    ln_open = {"S":S,"H":Ht,"D":D,"C":C}[opener_suit]
-    if H>=12 and ln_open<=2:
-        out.append(Suggestion("X","Takeout double: 12+ HCP, short in opener’s suit; support for unbid."))
-    if not out: out=[Suggestion("Pass","No safe overcall/double by these rules.")]
-    return out
+        # --- CONVENTION LOGIC (Highest Priority) ---
+        if is_partner_last and last_bid == '1NT':
+            if bid_string == '2C':
+                explanation.update({"convention": "Stayman", "meaning": "Artificial, asking for 4-card major suits.", "hcp_range": "8+ HCP", "implied_shape": "At least one 4-card Major."})
+                return explanation
+            if bid_string == '2D':
+                explanation.update({"convention": "Jacoby Transfer to Hearts", "meaning": "Artificial, forces 2H. Promises 5+ Hearts.", "hcp_range": "8+ HCP", "implied_shape": "5+ Hearts."})
+                return explanation
+            if bid_string == '2H':
+                explanation.update({"convention": "Jacoby Transfer to Spades", "meaning": "Artificial, forces 2S. Promises 5+ Spades.", "hcp_range": "8+ HCP", "implied_shape": "5+ Spades."})
+        
+        if bid_string == '4NT':
+            if self.trump_suit:
+                explanation.update({"convention": "Key Card Blackwood (RKCB 1430)", "meaning": f"Asking for Key Cards (4 Aces + {self.trump_suit} King).", "hcp_range": "Slam interest."})
+                return explanation
+            elif last_bid in ['1NT', '2NT', '3NT']:
+                explanation.update({"convention": "Quantitative NT", "meaning": "Invitational to 6NT.", "hcp_range": "18-19 HCP (after 1NT)"})
+                return explanation
+        
+        if bid_string == '4C' and last_bid in ['1NT', '2NT', '3NT']:
+            explanation.update({"convention": "Gerber", "meaning": "Asking for Aces (after a NT agreement).", "hcp_range": "Slam interest."})
+            return explanation
 
-def responder_suggestions(opener_bid:str, hand:Hand, auction:List[str])->List[Suggestion]:
-    h=hand.hcp; S,Ht,D,C=hand.shape; out=[]
-    if opener_bid=="1NT":
-        if Ht>=5: out.append(Suggestion("2D","Transfer to ♥ (5+ hearts)."))
-        if S>=5: out.append(Suggestion("2H","Transfer to ♠ (5+ spades)."))
-        if (S>=4 or Ht>=4) and h>=8: out.append(Suggestion("2C","Stayman — asks for 4-card major (8+ HCP)."))
-        if S<5 and Ht<5:
-            min_tot = h+15; max_tot = h+17
-            if h<=7: out.append(Suggestion("Pass","0–7 HCP, no 5-card major."))
-            if 8<=h<=9: out.append(Suggestion("2NT","Invite: 8–9 HCP (combined ≈%d–%d)"%(min_tot,max_tot)))
-            if h>=10:
-                out.append(Suggestion("3NT","Game: 10+ HCP opposite 1NT (combined ≈%d–%d)"%(min_tot,max_tot)))
-                if h>=16: out.append(Suggestion("4NT","Quantitative: invite 6NT with 16+ opposite 15–17."))
-                if h>=20: out.append(Suggestion("6NT","Small slam tendency (combined ≈%d–%d)"%(h+15,h+17)))
-                if h>=21: out.append(Suggestion("7NT","Grand slam tendency (combined ≈%d–%d)"%(h+15,h+17)))
-        if h>=13: out.append(Suggestion("4C","Gerber: ask for aces over NT (slam interest)."))
-        return out
+        # --- NATURAL RESPONSE / OVERCALL LOGIC ---
+        
+        if current_bidder != last_bidder and not is_partner_last: # Overcall / Double
+            if bid_string == 'X':
+                hcp_low, hcp_high, shape = self.SAYC_RANGES['TAKEOUT_DOUBLE']
+                explanation.update({"meaning": "Takeout Double (not for penalty).", "hcp_range": f"{hcp_low}+ TP", "implied_shape": shape})
+                return explanation
+            elif bid_string in ['1S', '2H', '3D', '4C']:
+                hcp_low, hcp_high, shape = self.SAYC_RANGES['OVERCALL']
+                explanation.update({"meaning": f"Natural Overcall in {bid_string[-1]}.", "hcp_range": f"{hcp_low}-{hcp_high} TP", "implied_shape": "Good 5+ card suit."})
+                return explanation
 
-    if opener_bid in ["1S","1H"]:
-        trump = "S" if opener_bid=="1S" else "H"; ln = S if trump=="S" else Ht
-        if ln>=3:
-            if 6<=h<=9: out.append(Suggestion(f"2{trump}", f"Single raise: {ln} trumps, 6–9 HCP."))
-            if 10<=h<=12: out.append(Suggestion(f"3{trump}", f"Limit raise: {ln}+ trumps, 10–12 HCP."))
-            if h>=13:
-                out.append(Suggestion(f"4{trump}", f"Game raise: {ln}+ trumps, 13+ HCP (≈25+ combined)."))
-                out.append(Suggestion("2NT","Jacoby 2NT: GF raise with 4+ support, 13+ HCP (slam interest)."))
-        if 6<=h<=10: out.append(Suggestion("1NT","6–10, no fit (semi-forcing)."))
-        for suit,ln2 in [("H",Ht),("S",S),("D",D),("C",C)]:
-            if suit!=trump and ln2>=4 and h>=10:
-                out.append(Suggestion(f"2{suit}", f"New suit: 10+ HCP, 4+ {suit}."))
-        if not out: out=[Suggestion("Pass","Too weak.")]
-        return out
+        if is_partner_last and last_bid in ['1C', '1D', '1H', '1S']: # Suit Response
+            if len(bid_string) == 2 and bid_string[1] == last_bid[1] and bid_string[0] == '2': # Simple Raise 
+                hcp_low, hcp_high, shape = self.SAYC_RANGES['SIMPLE_RAISE']
+                explanation.update({"meaning": f"Simple Non-forcing Raise in {bid_string[-1]}.", "hcp_range": f"{hcp_low}-{hcp_high} TP", "implied_shape": shape})
+                return explanation
+            
+        # Default for pass or other bids
+        if bid_string == 'P':
+            return {"meaning": "Pass.", "hcp_range": "Does not meet requirements for a bid.", "implied_shape": "N/A", "convention": "None"}
+        
+        return explanation
 
-    if opener_bid in ["1D","1C"]:
-        if S>=4 and h>=6: out.append(Suggestion("1S","4+ spades, 6+ HCP."))
-        if Ht>=4 and h>=6: out.append(Suggestion("1H","4+ hearts, 6+ HCP."))
-        if S<4 and Ht<4 and 6<=h<=10: out.append(Suggestion("1NT","6–10 balanced, no 4-card major."))
-        if opener_bid=="1D" and D>=4 and 6<=h<=9: out.append(Suggestion("2D","Raise ♦, 6–9."))
-        if opener_bid=="1C" and C>=4 and 6<=h<=9: out.append(Suggestion("2C","Raise ♣, 6–9."))
-        if not out: out=[Suggestion("Pass","Too weak.")]
-        return out
 
-    if opener_bid=="2NT":
-        min_tot = h+20; max_tot = h+21
-        if h<=3: return [Suggestion("Pass","Very weak opposite 20–21.")]
-        out=[Suggestion("3NT","Game opposite 20–21 (combined ≈%d–%d)"%(min_tot,max_tot))]
-        if h>=5: out.append(Suggestion("4C","Gerber: ask for aces (slam interest)."))
-        if h>=11: out.append(Suggestion("4NT","Quantitative: invite 6NT (combined ≈%d–%d)"%(min_tot,max_tot)))
-        if h>=13: out.append(Suggestion("6NT","Small slam tendency (combined ≈%d–%d)"%(min_tot,max_tot)))
-        if h>=16: out.append(Suggestion("7NT","Grand slam tendency (combined ≈%d–%d)"%(min_tot,max_tot)))
-        return out
+    def suggest_bid(self, user_hand, vulnerability):
+        """
+        Provides the optimal bid and justification for the User (South).
+        user_hand: {'hcp': X, 'dist': [S, H, D, C]}
+        """
+        hcp = user_hand['hcp']
+        dist = user_hand['dist']
+        
+        # Calculate Total Points (HCP + simple length points)
+        tp = hcp + sum([max(0, d - 4) for d in dist])
 
-    if opener_bid=="2C":
-        return [Suggestion("2D","Waiting (artificial), game forcing.")]
+        last_bid, last_bidder, is_partner_last = self._get_last_bid_info()
+        
+        # --- PHASE 1: OPENING BID (If User is the first to bid meaningfully) ---
+        if not last_bid:
+            if hcp >= 15 and hcp <= 17 and max(dist) <= 5: 
+                return '1NT', f"Open 1NT. You have a balanced hand with 15-17 HCP."
+            
+            if hcp >= 12:
+                # Prioritize 5-card Majors
+                if dist[0] >= 5: return '1S', "Open 1 Spades (5+ cards, 12+ HCP)."
+                if dist[1] >= 5: return '1H', "Open 1 Hearts (5+ cards, 12+ HCP)."
+                # Prioritize 4-card Diamonds over 3-card Clubs
+                if dist[2] >= 4: return '1D', "Open 1 Diamond (4+ cards, 12+ HCP)."
+                if dist[3] >= 3: return '1C', "Open 1 Club (3+ cards, 12+ HCP)."
+            
+            return 'Pass', "You have less than 12 HCP, so the correct opening call is Pass."
 
-    return [Suggestion("Pass","No rule matched.")]
+        # --- PHASE 2: CONVENTIONAL RESPONSES (After Partner's Bid) ---
+        if is_partner_last:
+            if last_bid == '1NT':
+                if hcp < 8:
+                     return 'Pass', "Pass. You lack the 8 HCP minimum for a forcing response to 1NT."
+                     
+                # Stayman Check (4-card Major)
+                if dist[0] >= 4 or dist[1] >= 4:
+                    return '2C', "Bid 2 Clubs (Stayman) to ask for partner's 4-card Majors."
+                # Jacoby Transfers
+                if dist[1] >= 5: 
+                    return '2D', "Bid 2 Diamonds (Jacoby Transfer) to show 5+ Hearts."
+                if dist[0] >= 5: 
+                    return '2H', "Bid 2 Hearts (Jacoby Transfer) to show 5+ Spades."
+                
+                # NT bids
+                if hcp >= 13:
+                    return '3NT', "Bid 3NT for game. You have 13+ HCP and a balanced hand without a Major fit."
+                if hcp >= 10 and hcp <= 12:
+                    return '2NT', "Bid 2NT (Invitational). You have 10-12 HCP for a possible 3NT."
 
-# ---- Slam auto-replies ----
-def auto_reply_rkcb(our_cards: List[str]) -> str:
-    aces = count_aces(our_cards)
-    mapping = {0:"5C",1:"5D",2:"5H",3:"5S",4:"5C"}
-    return mapping.get(aces, "5C")
+            # Blackwood / Gerber Response (Simplified logic)
+            if last_bid == '4NT' and self.trump_suit: 
+                # Very simple Key Card count (HCP for demo)
+                key_cards = hcp // 7 
+                if key_cards in [0, 3]: return '5C', "Responding to RKCB: 0 or 3 Key Cards."
+                if key_cards in [1, 4]: return '5D', "Responding to RKCB: 1 or 4 Key Cards."
+                if key_cards == 2: return '5H', "Responding to RKCB: 2 Key Cards (simplified)."
 
-def auto_reply_gerber(our_cards: List[str]) -> str:
-    aces = count_aces(our_cards)
-    mapping = {0:"4D",1:"4H",2:"4S",3:"4NT",4:"4D"}
-    return mapping.get(aces, "4D")
+        # --- PHASE 3: NATURAL RESPONSES / RAISES (After Partner's Opening Suit) ---
+        if is_partner_last and last_bid in ['1C', '1D', '1H', '1S']:
+            partner_suit = last_bid[-1]
+            p_idx = self.SUIT_MAP[partner_suit]
+            
+            # Find a Fit (3+ cards needed for major, 4+ for minor raise)
+            if dist[p_idx] >= 3:
+                combined_tp = 12 + tp # Assume partner minimum 12
+                
+                if combined_tp >= 25:
+                    return f'4{partner_suit}', f"Bid game: 4{partner_suit}. You have a fit and 25+ combined TP."
+                if combined_tp >= 22:
+                    return f'3{partner_suit}', f"Bid 3{partner_suit} (Invitational). You have a fit and 22-24 combined TP."
+                if hcp >= 6:
+                    return f'2{partner_suit}', f"Simple Non-forcing Raise to 2{partner_suit} (6-9 TP)."
 
-def nt_context_exists(auction: List[str]) -> bool:
-    return any(b in ["1NT","2NT","3NT"] for b in auction)
+            # New Suit (No Fit)
+            if hcp >= 6:
+                # Bid 1 Major over 1 Minor
+                if last_bid in ['1C', '1D']:
+                    if dist[0] >= 4: return '1S', "Bid your 4+ card Major, 1 Spades (forcing)."
+                    if dist[1] >= 4: return '1H', "Bid your 4+ card Major, 1 Hearts (forcing)."
 
-def major_fit_agreed(auction: List[str]) -> Optional[str]:
-    majors = ["H","S"]
-    bids = [b for b in auction if b not in ["Pass","X","XX"]]
-    for M in majors:
-        if any(b in [f"2{M}",f"3{M}",f"4{M}"] for b in bids):
-            return M
-    return None
+                # Bid 1NT if no fit and not enough for a new suit/higher level
+                return '1NT', "No fit, 6-9 HCP, balanced. Non-forcing 1NT."
 
-# ---- Advise your bid (your turn only) ----
-def advise_your_bid(your_hand:Hand, auction:List[str]) -> List[Suggestion]:
-    # Redouble opportunity
-    if auction and auction[-1]=="X":
-        if your_hand.hcp>=10:
-            return [Suggestion("XX","Redouble with 10+ HCP after partner's double.")]
-        else:
-            return [Suggestion("Bid best suit","Runout after partner's double (not fully modeled).")]
+        # --- PHASE 4: COMPETITION (After Opponent's Bid) ---
+        if last_bidder in ['E', 'W'] and last_bid != 'P':
+            # Takeout Double
+            if hcp >= 12 and random.choice([True, False]): # Simple demo of suitability
+                return 'X', "Bid Takeout Double. You have 12+ HCP, shortage in opponent's suit implied."
+            
+            # Simple Overcall
+            suits = sorted([(dist[i], s) for i, s in enumerate(['S', 'H', 'D', 'C'])], reverse=True)
+            if suits[0][0] >= 5 and hcp >= 8:
+                return f'1{suits[0][1]}', f"Overcall in your best 5+ card suit, 1{suits[0][1]} (8+ TP)."
+            
+            # Default to Pass if defense/competition is too risky
+            return 'Pass', "Pass. Hand too weak or bid too high to compete safely."
 
-    # Auto replies to ace-asking conventions
-    if auction and auction[-1]=="4NT" and major_fit_agreed(auction):
-        reply = auto_reply_rkcb(your_hand.cards)
-        return [Suggestion(reply, f"Auto-reply to RKCB (4NT): showing aces ({reply}).")]
-    if auction and auction[-1]=="4C" and nt_context_exists(auction):
-        reply = auto_reply_gerber(your_hand.cards)
-        return [Suggestion(reply, f"Auto-reply to Gerber (4♣ over NT): showing aces ({reply}).")]
+        # Default Safety Net
+        return 'Pass', "Pass. No clear action is suggested by the SAYC system at this point."
 
-    # Identify last real call
-    real_calls = [b for b in auction if b not in ["Pass","X","XX"]]
-    if real_calls:
-        last = real_calls[-1]
-        # If odd number of total calls, assume RHO acted last => overcall space
-        if (len(auction) % 2)==1:
-            return overcall_suggestions(last, your_hand)
-        else:
-            # Partner acted last => responder logic
-            sugs = responder_suggestions(last, your_hand, auction)
-            pmin,pmax = partner_range_guess(auction)
-            min_tot, max_tot = pmin+your_hand.hcp, pmax+your_hand.hcp
-            fit = major_fit_agreed(auction)
-            if fit and min_tot>=33:
-                sugs.append(Suggestion("4NT", f"RKCB (slam try in {'♥' if fit=='H' else '♠'}); combined ≈%d–%d"%(min_tot,max_tot)))
-            if nt_context_exists(auction) and min_tot>=32:
-                sugs.append(Suggestion("4NT","Quantitative: invite 6NT (combined high totals)."))
-            if nt_context_exists(auction) and min_tot>=33:
-                sugs.append(Suggestion("6NT", "Small slam tendency (combined ≈%d–%d)"%(min_tot,max_tot)))
-            if nt_context_exists(auction) and min_tot>=37:
-                sugs.append(Suggestion("7NT", "Grand slam tendency (combined ≈%d–%d)"%(min_tot,max_tot)))
-            return sugs
-    else:
-        # No one opened yet -> it's your opening
-        return opening_suggestions(your_hand)
 
-# ---- Interactive loop ----
-SEATS = ["N","E","S","W"]
-NEXT = {"N":"E","E":"S","S":"W","W":"N"}
-
-def run_loop():
-    print("== Bridge Bidding Engine — Full (Colab-ready) ==")
-    while True:
-        you = input("Your seat (N/E/S/W): ").strip().upper()
-        if you in SEATS: break
-    while True:
-        dealer = input("Dealer/Who starts (N/E/S/W): ").strip().upper()
-        if dealer in SEATS: break
-    hstr = input("Enter YOUR 13 cards (e.g., 'J643.AJ54.A7.T97' or 'AS KH QH JD ...'): ").strip()
-    your = Hand(parse_hand_string(hstr))
-    print(f"Your HCP: {your.hcp}, Shape (S,H,D,C): {your.shape} — Balanced? {'Yes' if is_balanced(your.shape) else 'No'}")
-
-    turn = dealer
-    auction: List[str] = []
-    passes = 0
-
-    while True:
-        print("\nAuction so far:", " ".join(auction) if auction else "(none)")
-        print(f"Turn: {turn}")
-        if turn==you:
-            sugs = advise_your_bid(your, auction)
-            print("Your suggestions (with points):")
-            for i,s in enumerate(sugs,1):
-                print(f"  {i}) {s.bid} — {s.reason}")
-            call = input("Your call (Enter = choose 1): ").strip().upper()
-            if call=="":
-                call = sugs[0].bid.upper()
-            print(f"You bid: {call}")
-            auction.append(call)
-        else:
-            call = input(f"Enter {turn}'s call (e.g., PASS, 1S, X, 2NT, 4NT, 4C) [default PASS]: ").strip().upper() or "PASS"
-            auction.append(call)
-
-        if auction[-1]=="PASS":
-            passes += 1
-        else:
-            passes = 0
-
-        if passes>=3 and len(auction)>=4:
-            print("\n=== Auction finished ===")
-            print("Final auction:", " ".join(auction))
-            break
-
-        turn = NEXT[turn]
-
-# If running in Colab/Jupyter, call run_loop() directly or import and call later.
-if __name__=="__main__":
-    run_loop()
+## Helper for Streamlit: Convert dist array to a string
+def format_hand_distribution(dist):
+    return f"S:{dist[0]} H:{dist[1]} D:{dist[2]} C:{dist[3]}"
